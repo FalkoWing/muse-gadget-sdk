@@ -295,7 +295,11 @@ static size_t largest_free_block;
 static void *limited_malloc(size_t n) {
     return n > largest_free_block ? NULL : malloc(n);
 }
+static void *limited_realloc(void *p, size_t n) {
+    return n > largest_free_block ? NULL : realloc(p, n);
+}
 #define malloc limited_malloc
+#define realloc limited_realloc
 static uint16_t s_mtu;
 static uint8_t *s_rx_buf;
 static size_t s_rx_len, s_rx_cap;
@@ -308,15 +312,14 @@ static uint8_t s_rx_total, s_rx_count, s_rx_next_idx;
         harness += _function_body(ble, "static void handle_rx_write_locked(") + "}\n"
         harness += r"""
 // Returns the reassembled length, or 0 when the message was dropped.
-static size_t send_message(size_t len, size_t chunk) {
+// Chunk i is chunks[i] long, the last one whatever remains.
+static size_t send_chunks(size_t len, const size_t *chunks, size_t total) {
     static uint8_t message[MAX_RX_TOTAL_BYTES + 1], frame[CHUNK_HEADER_BYTES + 512];
     for (size_t i = 0; i < len; i++) message[i] = (uint8_t)(i * 7 + 1);
-    size_t total = (len + chunk - 1) / chunk;
     uint8_t *complete = NULL;
     size_t complete_len = 0;
-    for (size_t i = 0; i < total; i++) {
-        size_t off = i * chunk;
-        size_t flen = len - off < chunk ? len - off : chunk;
+    for (size_t i = 0, off = 0; i < total; off += chunks[i++]) {
+        size_t flen = i + 1 == total ? len - off : chunks[i];
         frame[0] = CHUNK_MAGIC;
         frame[1] = (uint8_t)i;
         frame[2] = (uint8_t)total;
@@ -328,6 +331,12 @@ static size_t send_message(size_t len, size_t chunk) {
     assert(complete_len == len && !memcmp(complete, message, len));
     free(complete);
     return complete_len;
+}
+static size_t send_message(size_t len, size_t chunk) {
+    static size_t chunks[MAX_RX_TOTAL_BYTES + 1];
+    size_t total = (len + chunk - 1) / chunk;
+    for (size_t i = 0; i < total; i++) chunks[i] = chunk;
+    return send_chunks(len, chunks, total);
 }
 int main(void) {
     // The Muse app's credentials message, with the 7 KB largest free block
@@ -343,6 +352,20 @@ int main(void) {
     assert(send_message(1500, 500) == 1500);
     s_mtu = 23;
     assert(send_message(2800, 241) == 2800);
+    // A later chunk longer than the first, e.g. a long write after a short
+    // one, or a first chunk that arrived before the MTU was known.
+    s_mtu = 247;
+    assert(send_chunks(741, (const size_t[]){241, 500}, 2) == 741);
+    s_mtu = 23;
+    assert(send_chunks(1100, (const size_t[]){100, 500, 500}, 3) == 1100);
+    // ...but still not past the overall limit.
+    s_mtu = 247;
+    size_t past_limit[17] = {241};
+    for (size_t i = 1; i < 17; i++) past_limit[i] = 500;
+    assert(send_chunks(MAX_RX_TOTAL_BYTES + 1, past_limit, 17) == 0);
+    // Growing needs the memory too.
+    largest_free_block = 482;
+    assert(send_chunks(741, (const size_t[]){241, 500}, 2) == 0);
     return 0;
 }
 """
